@@ -4,6 +4,8 @@ import sys
 import numpy as np
 import argparse
 import json
+import pandas as pd
+import random
 # Add fast3r directory to sys.path
 # Assuming fast3r folder is in the same directory as this script
 fast3r_path = os.path.join(os.path.dirname(__file__), 'fast3r')
@@ -19,7 +21,7 @@ from fast3r.dust3r.inference_multiview import inference
 from fast3r.utils.checkpoint_utils import load_model
 from fast3r.models.multiview_dust3r_module import MultiViewDUSt3RLitModule
 
-def run_fast3r_batch(input_folder, point_size=0.0004, min_conf_thr_percentile=10, global_conf_thr=1.5,
+def run_fast3r_batch(img_paths, point_size=0.0004, min_conf_thr_percentile=10, global_conf_thr=1.5,
                      image_size=512, rotate_clockwise_90=False, crop_to_landscape=False,
                      device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
 
@@ -27,11 +29,8 @@ def run_fast3r_batch(input_folder, point_size=0.0004, min_conf_thr_percentile=10
     checkpoint_dir = "jedyang97/Fast3R_ViT_Large_512"
     model, lit_module = load_model(checkpoint_dir, device=device, is_lightning_checkpoint=False)
 
-    # Collect image paths
-    img_paths = [os.path.join(input_folder, f) for f in sorted(os.listdir(input_folder))
-                 if f.lower().endswith((".jpg", ".jpeg", ".png"))]
     if not img_paths:
-        raise ValueError("No images found in the folder")
+        raise ValueError("No images provided")
 
     # Load and preprocess images
     imgs = load_images(
@@ -262,109 +261,126 @@ def save_results(results, output_folder="output"):
     except ImportError:
         print("⚠️ trimesh not available, skipping PLY export")
 
-def load_gps_coordinates(gps_file):
+def load_coordinates_from_csv(csv_file):
     """
-    Load GPS coordinates from a JSON file.
+    Load real-world coordinates from a CSV file.
     
-    Expected format:
-    {
-        "image1.jpg": {"lat": 40.7128, "lon": -74.0060, "alt": 10.0},
-        "image2.jpg": {"lat": 40.7589, "lon": -73.9851, "alt": 15.0},
-        ...
-    }
+    Expected CSV format:
+    image_name,timestamp,latitude,longitude,altitude,relative_alt,x_m,y_m,z_m
+    img_0000.jpg,2025-07-16 21:11:40,38.6344281,-90.227515,154.69,2.576,-0.5396,1.9249,0.6250
+    img_0001.jpg,2025-07-16 21:11:42,38.634425199999995,-90.22748589999999,155.059,2.945,-0.8758,0.7347,0.2530
     
     Args:
-        gps_file: Path to JSON file containing GPS coordinates
+        csv_file: Path to CSV file containing coordinates
         
     Returns:
-        dict: Dictionary mapping image names to GPS coordinates
+        dict: Dictionary mapping image names to real-world coordinates
     """
-    with open(gps_file, 'r') as f:
-        gps_data = json.load(f)
-    return gps_data
+    try:
+        df = pd.read_csv(csv_file)
+        coord_data = {}
+        
+        for _, row in df.iterrows():
+            coord_data[row['image_name']] = {
+                'x': row['x_m'],
+                'y': row['y_m'], 
+                'z': row['z_m'],
+                'lat': row['latitude'],
+                'lon': row['longitude'],
+                'alt': row['altitude']
+            }
+        
+        return coord_data
+    except Exception as e:
+        print(f"Error loading CSV file: {e}")
+        return None
 
-def gps_to_cartesian(lat, lon, alt=0):
+def select_random_images(input_folder, csv_file, num_images=4):
     """
-    Convert GPS coordinates to Cartesian coordinates using simple projection.
-    
-    Note: This is a simplified conversion. For more accurate results over large distances,
-    consider using proper map projections like UTM.
+    Select random images that exist in both the folder and CSV file.
     
     Args:
-        lat: Latitude in degrees
-        lon: Longitude in degrees  
-        alt: Altitude in meters (optional)
+        input_folder: Path to folder containing images
+        csv_file: Path to CSV file with coordinates
+        num_images: Number of images to select (default: 4)
         
     Returns:
-        numpy.array: [x, y, z] coordinates in meters
+        tuple: (selected_img_paths, coord_data_subset)
     """
-    # Earth radius in meters
-    R = 6378137.0
+    # Load coordinate data
+    coord_data = load_coordinates_from_csv(csv_file)
+    if coord_data is None:
+        return None, None
     
-    # Convert to radians
-    lat_rad = np.radians(lat)
-    lon_rad = np.radians(lon)
+    # Get all available images in folder
+    all_img_files = [f for f in os.listdir(input_folder) 
+                     if f.lower().endswith((".jpg", ".jpeg", ".png"))]
     
-    # Simple equirectangular projection (works well for small areas)
-    # More accurate projections should be used for larger areas
-    x = R * lon_rad * np.cos(lat_rad)
-    y = R * lat_rad
-    z = alt
+    # Filter images that have coordinates
+    available_images = [img for img in all_img_files if img in coord_data]
     
-    return np.array([x, y, z])
+    if len(available_images) < num_images:
+        print(f"Warning: Only {len(available_images)} images available, requested {num_images}")
+        num_images = len(available_images)
+    
+    # Randomly select images
+    selected_images = random.sample(available_images, num_images)
+    selected_img_paths = [os.path.join(input_folder, img) for img in selected_images]
+    
+    # Create subset of coordinate data
+    coord_data_subset = {img: coord_data[img] for img in selected_images}
+    
+    print(f"Selected {len(selected_images)} random images:")
+    for img in selected_images:
+        coord = coord_data[img]
+        print(f"  {img}: x={coord['x']:.3f}, y={coord['y']:.3f}, z={coord['z']:.3f}")
+    
+    return selected_img_paths, coord_data_subset
 
-def compute_real_world_scale(camera_poses, img_paths, gps_file, min_pairs=3):
+def compute_real_world_scale(camera_poses, img_paths, coord_data, min_pairs=2):
     """
     Compute the real-world scale of the reconstruction by comparing
-    camera pose distances with real GPS distances.
+    camera pose distances with real-world distances from CSV data.
     
     Args:
         camera_poses: List of 4x4 camera-to-world transformation matrices
         img_paths: List of image file paths (same order as camera_poses)
-        gps_file: Path to JSON file with GPS coordinates
+        coord_data: Dictionary mapping image names to real-world coordinates
         min_pairs: Minimum number of camera pairs to use for scale estimation
         
     Returns:
         dict: Dictionary containing scale factor and statistics
     """
     print("\n" + "=" * 60)
-    print("COMPUTING REAL-WORLD SCALE FROM GPS")
+    print("COMPUTING REAL-WORLD SCALE FROM CSV COORDINATES")
     print("=" * 60)
     
-    # Load GPS coordinates
-    try:
-        gps_data = load_gps_coordinates(gps_file)
-        print(f"✅ Loaded GPS data for {len(gps_data)} images")
-    except FileNotFoundError:
-        print(f"❌ GPS file not found: {gps_file}")
-        return None
-    except Exception as e:
-        print(f"❌ Error loading GPS file: {e}")
+    if coord_data is None:
+        print("❌ No coordinate data available")
         return None
     
-    # Match images with GPS coordinates
+    # Match images with coordinates
     matched_data = []
     for i, img_path in enumerate(img_paths):
         img_name = os.path.basename(img_path)
-        if img_name in gps_data:
-            gps_coord = gps_data[img_name]
+        if img_name in coord_data:
+            coord = coord_data[img_name]
             camera_pos = camera_poses[i][:3, 3]  # Extract camera position
-            real_pos = gps_to_cartesian(gps_coord['lat'], gps_coord['lon'], 
-                                      gps_coord.get('alt', 0))
+            real_pos = np.array([coord['x'], coord['y'], coord['z']])
             matched_data.append({
                 'img_name': img_name,
                 'camera_pos': camera_pos,
                 'real_pos': real_pos,
-                'gps': gps_coord
+                'coord': coord
             })
         else:
-            print(f"⚠️ No GPS data found for {img_name}")
+            print(f"⚠️ No coordinate data found for {img_name}")
     
     if len(matched_data) < 2:
-        print(f"❌ Need at least 2 images with GPS data, found {len(matched_data)}")
+        print(f"❌ Need at least 2 images with coordinate data, found {len(matched_data)}")
         return None
     
-    print(f"✅ Matched {len(matched_data)} images with GPS coordinates")
+    print(f"✅ Matched {len(matched_data)} images with real-world coordinates")
     
     # Compute pairwise distances
     scale_ratios = []
@@ -394,8 +410,8 @@ def compute_real_world_scale(camera_poses, img_paths, gps_file, min_pairs=3):
                 
                 print(f"  {data_i['img_name']} ↔ {data_j['img_name']}:")
                 print(f"    Fast3R distance: {fast3r_dist:.6f} units")
-                print(f"    Real distance: {real_dist:.2f} meters")
-                print(f"    Scale ratio: {scale_ratio:.2f} meters/unit")
+                print(f"    Real distance: {real_dist:.3f} meters")
+                print(f"    Scale ratio: {scale_ratio:.3f} meters/unit")
     
     if len(scale_ratios) < min_pairs:
         print(f"❌ Need at least {min_pairs} valid pairs, found {len(scale_ratios)}")
@@ -409,10 +425,10 @@ def compute_real_world_scale(camera_poses, img_paths, gps_file, min_pairs=3):
     
     print(f"\n📊 SCALE ESTIMATION RESULTS:")
     print(f"  Number of camera pairs: {len(scale_ratios)}")
-    print(f"  Mean scale: {mean_scale:.2f} ± {std_scale:.2f} meters/unit")
-    print(f"  Median scale: {median_scale:.2f} meters/unit")
-    print(f"  Min scale: {np.min(scale_ratios):.2f} meters/unit")
-    print(f"  Max scale: {np.max(scale_ratios):.2f} meters/unit")
+    print(f"  Mean scale: {mean_scale:.3f} ± {std_scale:.3f} meters/unit")
+    print(f"  Median scale: {median_scale:.3f} meters/unit")
+    print(f"  Min scale: {np.min(scale_ratios):.3f} meters/unit")
+    print(f"  Max scale: {np.max(scale_ratios):.3f} meters/unit")
     
     # Quality assessment
     cv = std_scale / mean_scale * 100  # Coefficient of variation
@@ -501,9 +517,15 @@ def parse_arguments():
         help="Output folder for results"
     )
     parser.add_argument(
-        "--gps_file", 
+        "--csv_file", 
         type=str,
-        help="Path to JSON file containing GPS coordinates for scale estimation"
+        help="Path to CSV file containing real-world coordinates for scale estimation"
+    )
+    parser.add_argument(
+        "--num_images", 
+        type=int, 
+        default=4,
+        help="Number of random images to select for processing (default: 4)"
     )
     parser.add_argument(
         "--rotate_clockwise_90", 
