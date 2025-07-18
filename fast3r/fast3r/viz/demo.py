@@ -26,6 +26,7 @@ from fast3r.dust3r.utils.image import load_images
 from fast3r.viz.viser_visualizer import start_visualization
 from fast3r.viz.video_utils import extract_frames_from_video
 from fast3r.utils.checkpoint_utils import load_model
+from fast3r.viz.tree_analysis import process_pointcloud_for_trees, format_tree_measurements_html
 
 # Add these global variables at the module level, after imports
 global_manager_req_queue = None
@@ -358,13 +359,13 @@ def process_images(uploaded_files, video_file, state,
     loading_html = """
     <div class="loading-box">
         <div class="loading-title">🚀 Fast3R is working its magic! ✨</div>
-        <div class="loading-subtitle">Preparing visualization</div>
+        <div class="loading-subtitle">Preparing visualization and tree analysis</div>
         <div>
             <span class="loading-emoji">🎨</span>
             <span class="loading-emoji">🌟</span>
-            <span class="loading-emoji">🔮</span>
+            <span class="loading-emoji">🌳</span>
         </div>
-        <p>Visualizing your 3D scene, please wait...</p>
+        <p>Visualizing your 3D scene and analyzing trees, please wait...</p>
     </div>
     <style>
         .loading-subtitle::after {
@@ -634,12 +635,75 @@ def process_images(uploaded_files, video_file, state,
         "style='border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);'></iframe>"
     )
 
+    # Perform tree analysis
+    try:
+        yield (
+            gr.update(visible=False),
+            gr.update(value=final_vis_header, visible=True),
+            gr.update(visible=True),
+            gr.update(value=viser_iframe_html, visible=True),
+            final_status + "\n🌳 Analyzing trees in the scene...",
+            state
+        )
+        
+        # Check if we have scale factor from GPS coordinates (if available)
+        scale_factor = None
+        scale_file = "output/scale_estimation.json"
+        if os.path.exists(scale_file):
+            try:
+                with open(scale_file, 'r') as f:
+                    scale_data = json.load(f)
+                    scale_factor = scale_data.get('scale_factor')
+            except:
+                pass
+        
+        # Perform tree analysis
+        tree_analysis_output_dir = "temp_tree_analysis"
+        if not is_example and 'save_dir' in locals():
+            tree_analysis_output_dir = os.path.join(save_dir, "tree_analysis")
+        elif is_example:
+            # For examples, create a temporary analysis directory
+            tree_analysis_output_dir = os.path.join(output_dir, "example_scenes", timestamp, "tree_analysis")
+        
+        tree_analysis_results = process_pointcloud_for_trees(
+            output_dict, 
+            scale_factor=scale_factor,
+            output_dir=tree_analysis_output_dir
+        )
+        
+        # Format tree analysis results as HTML
+        tree_analysis_html = format_tree_measurements_html(tree_analysis_results)
+        
+        # Update final visualization header to include tree analysis
+        final_vis_header_with_trees = final_vis_header + tree_analysis_html
+        
+        # Update final status
+        if tree_analysis_results.get("success", False):
+            num_trees = len(tree_analysis_results.get("measurements", []))
+            tree_status = f"\n🌳 Tree analysis: {num_trees} tree(s) detected and measured"
+        else:
+            tree_status = f"\n🌳 Tree analysis: {tree_analysis_results.get('message', 'No trees detected')}"
+        
+        final_status_with_trees = final_status + tree_status
+        
+    except Exception as e:
+        # If tree analysis fails, continue without it
+        print(f"Tree analysis failed: {e}")
+        tree_analysis_html = f"""
+        <div style="background: #ffebee; border: 1px solid #f44336; border-radius: 8px; padding: 15px; margin: 10px 0;">
+            <h3 style="color: #d32f2f; margin: 0 0 10px 0;">❌ Tree Analysis Error</h3>
+            <p style="margin: 0; color: #666;">Tree analysis failed: {str(e)}</p>
+        </div>
+        """
+        final_vis_header_with_trees = final_vis_header + tree_analysis_html
+        final_status_with_trees = final_status + "\n⚠️ Tree analysis failed"
+
     yield (
         gr.update(visible=False),                     # loading_html is now empty
-        gr.update(value=final_vis_header, visible=True),       # vis_header_html: detailed visualization header
+        gr.update(value=final_vis_header_with_trees, visible=True),       # vis_header_html: detailed visualization header with tree analysis
         gr.update(visible=True),         # feedback_column: now visible
         gr.update(value=viser_iframe_html, visible=True),      # iframe_html: the 3D viewer
-        final_status,               # status_text: final status text
+        final_status_with_trees,               # status_text: final status text with tree analysis
         state                           # updated state
     )
 
@@ -950,12 +1014,16 @@ def create_demo(checkpoint_dir, examples_dir, output_dir, device: torch.device, 
                     Upload unordered images of a scene, and Fast3R predicts 3D reconstructions 
                     and camera poses in one forward pass. Works with mixed camera types 
                     (e.g., iPhone + DSLR) and aspect ratios.
+                    <br><br>
+                    <strong>🌳 NEW: Automatic Tree Analysis!</strong><br>
+                    For outdoor scenes with trees, the system automatically detects and measures:
+                    <em>tree height, crown diameter, and crown area</em> in real-world units (when GPS data is available).
                 </div>
                 <div>
                     <b>How to use:</b><br>
                     3D from images: Select and upload multiple images of a scene (Ctrl/Shift + click to select multiple)<br>
                     3D from video: Upload a video (auto-samples at 1 FPS)<br>
-                    • Click 'Submit' to start reconstruction
+                    • Click 'Submit' to start reconstruction and tree analysis
                 </div>
             </div>
         </div>
