@@ -6,6 +6,9 @@ import argparse
 import json
 import pandas as pd
 import random
+import cv2
+from scipy import ndimage
+
 # Add fast3r directory to sys.path
 # Assuming fast3r folder is in the same directory as this script
 fast3r_path = os.path.join(os.path.dirname(__file__), 'fast3r')
@@ -21,7 +24,59 @@ from fast3r.dust3r.inference_multiview import inference
 from fast3r.utils.checkpoint_utils import load_model
 from fast3r.models.multiview_dust3r_module import MultiViewDUSt3RLitModule
 
-def run_fast3r_batch(img_paths, point_size=0.0004, min_conf_thr_percentile=10, global_conf_thr=1.5,
+def detect_sky_mask(img_rgb):
+    """
+    Detect sky pixels using HSV color space and morphological operations.
+    This is the same function used in the Gradio visualization.
+    
+    Args:
+        img_rgb: RGB image normalized to [-1, 1]
+    Returns:
+        Boolean mask (as int8) where True indicates non-sky pixels.
+    """
+    img = ((img_rgb + 1) * 127.5).astype(np.uint8)
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    lower_blue = np.array([105, 50, 140])
+    upper_blue = np.array([135, 255, 255])
+    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+
+    lower_light_blue = np.array([95, 5, 150])
+    upper_light_blue = np.array([145, 100, 255])
+    mask_light_blue = cv2.inRange(hsv, lower_light_blue, upper_light_blue)
+
+    lower_white = np.array([0, 0, 235])
+    upper_white = np.array([180, 10, 255])
+    mask_white = cv2.inRange(hsv, lower_white, upper_white)
+
+    mask = mask_blue | mask_light_blue | mask_white
+
+    height = mask.shape[0]
+    upper_third = int(height * 0.4)
+    upper_region = hsv[:upper_third, :, :]
+    mask[:upper_third, :] |= ((upper_region[:, :, 1] < 50) & (upper_region[:, :, 2] > 150))
+
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    mask = mask.astype(bool)
+    labels, num_labels = ndimage.label(mask)
+    if num_labels > 0:
+        top_row_labels = set(labels[0, :])
+        top_row_labels.discard(0)
+        if top_row_labels:
+            mask = np.isin(labels, list(top_row_labels))
+            labels, num_labels = ndimage.label(mask)
+            if num_labels > 0:
+                sizes = ndimage.sum(mask, labels, range(1, num_labels + 1))
+                mask_size = mask.size
+                big_enough = sizes > mask_size * 0.01
+                mask = np.isin(labels, np.where(big_enough)[0] + 1)
+    return (~mask).astype(np.int8)
+
+def run_fast3r_batch(img_paths, point_size=0.0004, min_conf_thr_percentile=85, global_conf_thr=1.5,
                      image_size=512, rotate_clockwise_90=False, crop_to_landscape=False,
                      device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
 
@@ -66,7 +121,7 @@ def run_fast3r_batch(img_paths, point_size=0.0004, min_conf_thr_percentile=10, g
     except Exception as e:
         print(f"Warning: {e}")
 
-    # Align local to global
+    # Align local to global (using same parameters as Gradio interface)
     lit_module.align_local_pts3d_to_global(
         preds=output_dict['preds'],
         views=output_dict['views'],
@@ -143,20 +198,23 @@ def explain_output_dict(output_dict):
             print(f"    - conf_local: {shape}")
             print(f"      → Confidence map for local predictions")
 
-def extract_camera_positions_and_pointcloud(output_dict, niter_PnP=100, min_conf_threshold_percentile=10):
+def extract_camera_positions_and_pointcloud_gradio_style(output_dict, niter_PnP=100, min_conf_threshold_percentile=85):
     """
-    Extract camera positions and final pointcloud from Fast3R output.
+    Extract camera positions and final pointcloud from Fast3R output using the same approach as Gradio visualization.
+    This includes sky masking, confidence sorting, and proper filtering.
     
     Returns:
     - camera_poses: List of 4x4 camera-to-world transformation matrices
     - estimated_focals: List of estimated focal lengths  
-    - pointclouds: List of 3D point arrays for each view
+    - pointclouds: List of processed 3D point arrays for each view (sky-filtered, confidence-sorted)
     - confidence_maps: List of confidence arrays for each view
-    - combined_pointcloud: Combined pointcloud from all views
+    - combined_pointcloud: Combined pointcloud from all views (sky-filtered)
+    - combined_colors: Combined colors for the pointcloud
+    - sky_filtered_data: Detailed per-view data matching Gradio visualization
     """
     
     print("\n" + "=" * 60)
-    print("EXTRACTING CAMERA POSITIONS AND POINTCLOUD")
+    print("EXTRACTING POINTCLOUD USING GRADIO VISUALIZATION STYLE")
     print("=" * 60)
     
     # 1. Estimate camera poses using PnP
@@ -174,62 +232,107 @@ def extract_camera_positions_and_pointcloud(output_dict, niter_PnP=100, min_conf
     print(f"✅ Estimated {len(camera_poses)} camera poses")
     print(f"✅ Estimated focal lengths: {estimated_focals}")
     
-    # 2. Extract pointclouds for each view
-    print(f"\n🗃️ Extracting pointclouds for each view...")
-    pointclouds = []
-    confidence_maps = []
+    # 2. Process each view using Gradio visualization approach
+    print(f"\n🌅 Processing each view with sky detection and confidence sorting...")
     
-    for i, pred in enumerate(output_dict['preds']):
-        # Get 3D points (in world coordinates)
-        pts3d = pred['pts3d_in_other_view'].cpu().numpy().squeeze()  # Shape: (H, W, 3)
-        conf = pred['conf'].cpu().numpy().squeeze()  # Shape: (H, W)
+    frame_data_list = []
+    all_combined_points = []
+    all_combined_colors = []
+    
+    for i, (pred, view) in enumerate(zip(output_dict['preds'], output_dict['views'])):
+        print(f"\n  Processing view {i}...")
         
-        pointclouds.append(pts3d)
-        confidence_maps.append(conf)
+        # Extract data from tensors (same as Gradio)
+        img_rgb_orig = view['img'].cpu().squeeze().permute(1,2,0).numpy()
+        pts3d_global = pred['pts3d_in_other_view'].cpu().squeeze().numpy().reshape(-1, 3)
+        conf_global = pred['conf'].cpu().squeeze().numpy().flatten()
+        img_rgb = view['img'].cpu().squeeze().permute(1,2,0).numpy()
+        img_rgb_flat = img_rgb.reshape(-1, 3)
         
-        print(f"  View {i}: {pts3d.shape} points, confidence range [{conf.min():.3f}, {conf.max():.3f}]")
-    
-    # 3. Create combined pointcloud with confidence filtering
-    print(f"\n🔗 Creating combined pointcloud (conf > {min_conf_threshold_percentile}th percentile)...")
-    combined_points = []
-    combined_colors = []
-    
-    for i, (pts3d, conf) in enumerate(zip(pointclouds, confidence_maps)):
-        # Get corresponding RGB colors from input image
-        img_rgb = output_dict['views'][i]['img'].cpu().numpy().squeeze().transpose(1, 2, 0)
-        # Convert from [-1, 1] to [0, 255]
-        img_rgb = ((img_rgb + 1) * 127.5).astype(np.uint8).clip(0, 255)
+        # Detect sky mask (same as Gradio)
+        not_sky_mask = detect_sky_mask(img_rgb_orig).flatten().astype(np.int8)
+        print(f"    Sky detection: {np.sum(not_sky_mask == 0)} sky pixels, {np.sum(not_sky_mask == 1)} non-sky pixels")
+        
+        # Sort by confidence (highest first, same as Gradio)
+        sort_idx_global = np.argsort(-conf_global)
+        sorted_conf_global = conf_global[sort_idx_global]
+        sorted_pts3d_global = pts3d_global[sort_idx_global]
+        sorted_img_rgb_global = img_rgb_flat[sort_idx_global]
+        sorted_not_sky_global = not_sky_mask[sort_idx_global]
+        
+        # Convert colors to [0,1] range (same as Gradio)
+        colors_rgb_global = ((sorted_img_rgb_global + 1) * 127.5).astype(np.uint8) / 255.0
         
         # Apply confidence threshold
-        conf_threshold = np.percentile(conf, min_conf_threshold_percentile)
-        mask = conf > conf_threshold
+        conf_threshold = np.percentile(sorted_conf_global, min_conf_threshold_percentile)
+        high_conf_mask = sorted_conf_global >= conf_threshold
         
-        # Flatten and filter
-        valid_points = pts3d[mask]  # Shape: (N_valid, 3)
-        valid_colors = img_rgb[mask]  # Shape: (N_valid, 3)
+        # Apply sky mask and confidence mask
+        valid_mask = high_conf_mask & (sorted_not_sky_global == 1)
         
-        combined_points.append(valid_points)
-        combined_colors.append(valid_colors)
+        # Filter points
+        valid_points = sorted_pts3d_global[valid_mask]
+        valid_colors = colors_rgb_global[valid_mask]
+        valid_conf = sorted_conf_global[valid_mask]
         
-        print(f"  View {i}: {valid_points.shape[0]} valid points (threshold: {conf_threshold:.3f})")
+        print(f"    Confidence threshold (P{min_conf_threshold_percentile}): {conf_threshold:.3f}")
+        print(f"    High confidence points: {np.sum(high_conf_mask)}")
+        print(f"    Sky-filtered + high confidence: {np.sum(valid_mask)} valid points")
+        
+        # Store processed data
+        frame_data = {
+            'view_idx': i,
+            'sorted_pts3d_global': sorted_pts3d_global,
+            'sorted_conf_global': sorted_conf_global,
+            'colors_rgb_global': colors_rgb_global,
+            'sorted_not_sky_global': sorted_not_sky_global,
+            'valid_mask': valid_mask,
+            'valid_points': valid_points,
+            'valid_colors': valid_colors,
+            'valid_conf': valid_conf,
+            'conf_threshold': conf_threshold,
+            'sky_ratio': 1.0 - np.mean(not_sky_mask),
+            'max_conf': conf_global.max(),
+            'img_shape': img_rgb_orig.shape[:2]
+        }
+        frame_data_list.append(frame_data)
+        
+        # Add to combined pointcloud
+        if len(valid_points) > 0:
+            all_combined_points.append(valid_points)
+            all_combined_colors.append(valid_colors)
     
-    # Combine all points
-    combined_pointcloud = np.vstack(combined_points) if combined_points else np.empty((0, 3))
-    combined_pointcloud_colors = np.vstack(combined_colors) if combined_colors else np.empty((0, 3))
+    # 3. Create final combined pointcloud
+    print(f"\n🔗 Creating final combined pointcloud...")
+    combined_pointcloud = np.vstack(all_combined_points) if all_combined_points else np.empty((0, 3))
+    combined_colors = np.vstack(all_combined_colors) if all_combined_colors else np.empty((0, 3))
     
-    print(f"✅ Combined pointcloud: {combined_pointcloud.shape[0]} total points")
+    total_valid_points = sum(len(fd['valid_points']) for fd in frame_data_list)
+    print(f"✅ Final combined pointcloud: {combined_pointcloud.shape[0]} total points")
+    print(f"✅ Average points per view: {total_valid_points / len(frame_data_list):.1f}")
+    
+    # 4. Summary statistics
+    sky_ratios = [fd['sky_ratio'] for fd in frame_data_list]
+    max_confs = [fd['max_conf'] for fd in frame_data_list]
+    print(f"\n📊 Scene statistics:")
+    print(f"    Sky ratios: min={min(sky_ratios):.3f}, max={max(sky_ratios):.3f}, avg={np.mean(sky_ratios):.3f}")
+    print(f"    Max confidences: min={min(max_confs):.3f}, max={max(max_confs):.3f}, avg={np.mean(max_confs):.3f}")
     
     return {
         'camera_poses': camera_poses,  # List of 4x4 camera-to-world matrices
         'estimated_focals': estimated_focals,  # List of focal lengths
-        'pointclouds_per_view': pointclouds,  # List of (H,W,3) arrays
-        'confidence_per_view': confidence_maps,  # List of (H,W) arrays  
-        'combined_pointcloud': combined_pointcloud,  # (N, 3) array
-        'combined_colors': combined_pointcloud_colors,  # (N, 3) array
+        'frame_data': frame_data_list,  # Detailed per-view data
+        'combined_pointcloud': combined_pointcloud,  # (N, 3) array - sky filtered
+        'combined_colors': combined_colors,  # (N, 3) array - sky filtered
+        'processing_params': {
+            'min_conf_threshold_percentile': min_conf_threshold_percentile,
+            'niter_PnP': niter_PnP,
+            'sky_filtering_enabled': True
+        }
     }
 
-def save_results(results, output_folder="output"):
-    """Save the extracted results to files."""
+def save_results_gradio_style(results, output_folder="output"):
+    """Save the extracted results to files (Gradio visualization style)."""
     
     os.makedirs(output_folder, exist_ok=True)
     
@@ -238,28 +341,62 @@ def save_results(results, output_folder="output"):
     np.save(camera_poses_file, np.array(results['camera_poses']))
     print(f"💾 Saved camera poses to {camera_poses_file}")
     
-    # Save combined pointcloud
-    pointcloud_file = os.path.join(output_folder, "combined_pointcloud.npy")
+    # Save combined pointcloud (sky-filtered)
+    pointcloud_file = os.path.join(output_folder, "combined_pointcloud_sky_filtered.npy")
     np.save(pointcloud_file, results['combined_pointcloud'])
-    print(f"💾 Saved combined pointcloud to {pointcloud_file}")
+    print(f"💾 Saved sky-filtered combined pointcloud to {pointcloud_file}")
     
     # Save colors
-    colors_file = os.path.join(output_folder, "combined_colors.npy")
+    colors_file = os.path.join(output_folder, "combined_colors_sky_filtered.npy")
     np.save(colors_file, results['combined_colors'])
-    print(f"💾 Saved pointcloud colors to {colors_file}")
+    print(f"💾 Saved sky-filtered pointcloud colors to {colors_file}")
+    
+    # Save detailed frame data
+    frame_data_file = os.path.join(output_folder, "frame_data_gradio_style.npy")
+    np.save(frame_data_file, results['frame_data'], allow_pickle=True)
+    print(f"💾 Saved detailed frame data to {frame_data_file}")
+    
+    # Save processing parameters
+    params_file = os.path.join(output_folder, "processing_params.json")
+    with open(params_file, 'w') as f:
+        json.dump(results['processing_params'], f, indent=2)
+    print(f"💾 Saved processing parameters to {params_file}")
     
     # Save as PLY file for visualization
     try:
         import trimesh
         point_cloud = trimesh.PointCloud(
             vertices=results['combined_pointcloud'],
-            colors=results['combined_colors']
+            colors=(results['combined_colors'] * 255).astype(np.uint8)  # Convert to 0-255 range
         )
-        ply_file = os.path.join(output_folder, "reconstruction.ply")
+        ply_file = os.path.join(output_folder, "reconstruction_sky_filtered.ply")
         point_cloud.export(ply_file)
-        print(f"💾 Saved PLY file to {ply_file}")
+        print(f"💾 Saved sky-filtered PLY file to {ply_file}")
+        
+        # Also save per-view PLY files
+        for i, fd in enumerate(results['frame_data']):
+            if len(fd['valid_points']) > 0:
+                view_cloud = trimesh.PointCloud(
+                    vertices=fd['valid_points'],
+                    colors=(fd['valid_colors'] * 255).astype(np.uint8)
+                )
+                view_ply_file = os.path.join(output_folder, f"view_{i:02d}_sky_filtered.ply")
+                view_cloud.export(view_ply_file)
+                print(f"💾 Saved view {i} PLY file to {view_ply_file}")
+                
     except ImportError:
         print("⚠️ trimesh not available, skipping PLY export")
+        print("   Install with: pip install trimesh")
+    
+    # Print summary
+    print(f"\n📊 Sky-filtered reconstruction summary:")
+    print(f"   Total points: {len(results['combined_pointcloud'])}")
+    print(f"   Views processed: {len(results['frame_data'])}")
+    avg_sky_ratio = np.mean([fd['sky_ratio'] for fd in results['frame_data']])
+    print(f"   Average sky ratio: {avg_sky_ratio:.1%}")
+    print(f"   Confidence threshold used: P{results['processing_params']['min_conf_threshold_percentile']}")
+    
+    return output_folder
 
 def load_coordinates_from_csv(csv_file):
     """
@@ -295,14 +432,14 @@ def load_coordinates_from_csv(csv_file):
         print(f"Error loading CSV file: {e}")
         return None
 
-def select_random_images(input_folder, csv_file, num_images=4):
+def select_random_images(input_folder, csv_file, num_images=5):
     """
-    Select random images that exist in both the folder and CSV file.
+    Select specific images (0004, 0005, 0006, 0007) that exist in both the folder and CSV file.
     
     Args:
         input_folder: Path to folder containing images
         csv_file: Path to CSV file with coordinates
-        num_images: Number of images to select (default: 4)
+        num_images: Number of images to select (default: 5, but will use specific images)
         
     Returns:
         tuple: (selected_img_paths, coord_data_subset)
@@ -312,25 +449,31 @@ def select_random_images(input_folder, csv_file, num_images=4):
     if coord_data is None:
         return None, None
     
+    # Define specific images to select
+    target_images = ["img_0004.jpg", "img_0005.jpg", "img_0006.jpg", "img_0007.jpg"]
+    
     # Get all available images in folder
     all_img_files = [f for f in os.listdir(input_folder) 
                      if f.lower().endswith((".jpg", ".jpeg", ".png"))]
     
-    # Filter images that have coordinates
-    available_images = [img for img in all_img_files if img in coord_data]
+    # Filter target images that exist in both folder and CSV
+    selected_images = []
+    for target_img in target_images:
+        if target_img in all_img_files and target_img in coord_data:
+            selected_images.append(target_img)
+        else:
+            print(f"Warning: {target_img} not found in folder or CSV data")
     
-    if len(available_images) < num_images:
-        print(f"Warning: Only {len(available_images)} images available, requested {num_images}")
-        num_images = len(available_images)
+    if len(selected_images) == 0:
+        print(f"❌ None of the target images {target_images} found in both folder and CSV")
+        return None, None
     
-    # Randomly select images
-    selected_images = random.sample(available_images, num_images)
     selected_img_paths = [os.path.join(input_folder, img) for img in selected_images]
     
     # Create subset of coordinate data
     coord_data_subset = {img: coord_data[img] for img in selected_images}
     
-    print(f"Selected {len(selected_images)} random images:")
+    print(f"Selected {len(selected_images)} specific images:")
     for img in selected_images:
         coord = coord_data[img]
         print(f"  {img}: x={coord['x']:.3f}, y={coord['y']:.3f}, z={coord['z']:.3f}")
@@ -494,8 +637,8 @@ def parse_arguments():
     parser.add_argument(
         "--min_conf_thr_percentile", 
         type=int, 
-        default=10,
-        help="Minimum confidence threshold percentile (0-100)"
+        default=85,
+        help="Minimum confidence threshold percentile (0-100) - Using 85 to match Gradio visualization"
     )
     parser.add_argument(
         "--global_conf_thr", 
@@ -524,8 +667,8 @@ def parse_arguments():
     parser.add_argument(
         "--num_images", 
         type=int, 
-        default=4,
-        help="Number of random images to select for processing (default: 4)"
+        default=5,
+        help="Number of random images to select for processing (default: 5)"
     )
     parser.add_argument(
         "--rotate_clockwise_90", 
@@ -561,9 +704,23 @@ if __name__ == "__main__":
     print(f"📁 Input folder: {args.input_folder}")
     print(f"🎛️ Parameters: point_size={args.point_size}, min_conf_thr_percentile={args.min_conf_thr_percentile}, global_conf_thr={args.global_conf_thr}")
     
+    # Select specific images if CSV file is provided
+    if args.csv_file:
+        print(f"\n� Selecting specific images (0004, 0005, 0006, 0007) with CSV coordinates...")
+        img_paths, coord_data = select_random_images(args.input_folder, args.csv_file, args.num_images)
+        if img_paths is None:
+            print("❌ Failed to select images. Exiting.")
+            sys.exit(1)
+    else:
+        # Use all images if no CSV file provided
+        print(f"\n📸 Using all available images (no CSV file provided)...")
+        img_paths = [os.path.join(args.input_folder, f) for f in sorted(os.listdir(args.input_folder))
+                     if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+        coord_data = None
+    
     # Run Fast3R
     result = run_fast3r_batch(
-        args.input_folder,
+        img_paths,
         point_size=args.point_size,
         min_conf_thr_percentile=args.min_conf_thr_percentile,
         global_conf_thr=args.global_conf_thr,
@@ -573,15 +730,11 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Get the image paths for reference
-    img_paths = [os.path.join(args.input_folder, f) for f in sorted(os.listdir(args.input_folder))
-                 if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    
     # Explain the output structure
     explain_output_dict(result)
     
-    # Extract what you need
-    extracted = extract_camera_positions_and_pointcloud(result, min_conf_threshold_percentile=args.min_conf_thr_percentile)
+    # Extract using Gradio visualization style (with sky filtering)
+    extracted = extract_camera_positions_and_pointcloud_gradio_style(result, min_conf_threshold_percentile=args.min_conf_thr_percentile)
     
     # Print summary
     print("\n" + "=" * 60)
@@ -605,13 +758,13 @@ if __name__ == "__main__":
         print(f"    Y: [{mins[1]:.3f}, {maxs[1]:.3f}]")
         print(f"    Z: [{mins[2]:.3f}, {maxs[2]:.3f}]")
     
-    # GPS-based scale estimation (if GPS file provided)
+    # GPS-based scale estimation (if CSV file provided)
     scale_result = None
-    if args.gps_file:
+    if args.csv_file and coord_data:
         scale_result = compute_real_world_scale(
             extracted['camera_poses'], 
             img_paths, 
-            args.gps_file
+            coord_data
         )
         
         if scale_result:
@@ -636,8 +789,8 @@ if __name__ == "__main__":
             extracted['scaled_pointcloud'] = scaled_pointcloud
             extracted['scale_info'] = scale_result
     
-    # Save results
-    save_results(extracted, args.output_folder)
+    # Save results using Gradio-style function
+    save_results_gradio_style(extracted, args.output_folder)
     
     # Save additional GPS/scale information if available
     if scale_result:
@@ -668,10 +821,34 @@ if __name__ == "__main__":
     
     print(f"\n✅ Done! Check the '{args.output_folder}' folder for saved files.")
     
-    if args.gps_file and not scale_result:
-        print(f"\n⚠️ GPS-based scaling failed. Check your GPS file format and image names.")
-        print(f"Expected GPS file format (JSON):")
-        print(f'{{')
-        print(f'  "image1.jpg": {{"lat": 40.7128, "lon": -74.0060, "alt": 10.0}},')
-        print(f'  "image2.jpg": {{"lat": 40.7589, "lon": -73.9851, "alt": 15.0}}')
-        print(f'}}')
+    # Summary of changes from basic test.py to Gradio-style processing
+    print(f"\n" + "=" * 60)
+    print("🎨 GRADIO VISUALIZATION STYLE PROCESSING APPLIED")
+    print("=" * 60)
+    print("Key improvements made to match Gradio interface:")
+    print("✅ Sky detection and filtering - removes sky pixels automatically")
+    print("✅ Higher confidence threshold (85th percentile vs 10th percentile)")
+    print("✅ Confidence-based sorting (highest confidence first)")
+    print("✅ Proper color normalization [0,1] range")
+    print("✅ Per-view processing matching visualization pipeline")
+    print("✅ Same alignment parameters as Gradio (min_conf_thr_percentile=85)")
+    print("")
+    print("Your pointcloud should now have:")
+    print("• Correct orientation (not upside down)")  
+    print("• Sky pixels removed")
+    print("• Higher quality points (better confidence filtering)")
+    print("• Colors that match the Gradio visualization")
+    print("")
+    print("Files saved:")
+    print("• reconstruction_sky_filtered.ply - Main PLY file for viewing")
+    print("• combined_pointcloud_sky_filtered.npy - Numpy array of 3D points")
+    print("• combined_colors_sky_filtered.npy - Numpy array of colors")
+    print("• view_XX_sky_filtered.ply - Individual view PLY files")
+    print("• frame_data_gradio_style.npy - Detailed processing data")
+    print("• processing_params.json - Parameters used")
+    
+    if args.csv_file and not scale_result:
+        print(f"\n⚠️ CSV-based scaling failed. Check your CSV file format and image names.")
+        print(f"Expected CSV file format:")
+        print(f"image_name,timestamp,latitude,longitude,altitude,relative_alt,x_m,y_m,z_m")
+        print(f"img_0000.jpg,2025-07-16 21:11:40,38.6344281,-90.227515,154.69,2.576,-0.5396,1.9249,0.6250")
