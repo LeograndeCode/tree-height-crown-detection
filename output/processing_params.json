@@ -1,0 +1,5 @@
+{
+  "min_conf_threshold_percentile": 85,
+  "niter_PnP": 100,
+  "sky_filtering_enabled": true
+}

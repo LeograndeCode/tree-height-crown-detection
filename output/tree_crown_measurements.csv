@@ -1,0 +1,2 @@
+tree_id,height_units,crown_diameter_units,crown_area_units2,bbox_width_units,bbox_height_units,area_pixels,centroid_x_pixel,centroid_y_pixel,height_meters,crown_diameter_meters,crown_area_meters2,bbox_width_meters,bbox_height_meters
+1,0.035750492662191394,0.04645129414091795,0.00016812686690320208,0.02796527684549801,0.07715720960986801,1481,310.5334233625928,207.19378798109386,3.476185056528087,4.516673268668512,1.5895669865289035,2.719192666533516,7.502350851038256

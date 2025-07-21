@@ -47,7 +47,6 @@ Thumbs.db
 
 # Results and outputs
 results/
-output/
 *.ply
 *.npy
 

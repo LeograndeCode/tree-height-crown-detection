@@ -1,0 +1,27 @@
+{
+  "individual_trees": [
+    {
+      "tree_id": 1,
+      "height_m": 4.890042680699825,
+      "diameter_m": 4.405275877782394,
+      "agb_kg": 54724.569495576,
+      "bgb_kg": 10944.9138991152,
+      "total_biomass_kg": 65669.4833946912,
+      "total_carbon_kg": 23805.18773057556,
+      "total_co2_lifetime_kg": 87365.0389712123,
+      "annual_co2_kg": 5824.3359314141535,
+      "daily_co2_kg": 15.95708474360042,
+      "tree_age_years": 15
+    }
+  ],
+  "summary": {
+    "total_trees": 1,
+    "total_co2_lifetime_kg": 87365.0389712123,
+    "total_co2_annual_kg": 5824.3359314141535,
+    "total_co2_daily_kg": 15.95708474360042,
+    "total_co2_lifetime_tons": 87.3650389712123,
+    "total_co2_annual_tons": 5.824335931414153,
+    "car_emissions_offset_percent": 126.61599850900333,
+    "tree_age_assumption_years": 15
+  }
+}
