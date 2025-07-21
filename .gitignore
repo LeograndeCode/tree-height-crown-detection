@@ -45,11 +45,6 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Results and outputs
-results/
-*.ply
-*.npy
-
 # Gradio temporary files
 gradio_tmp_dir/
 
